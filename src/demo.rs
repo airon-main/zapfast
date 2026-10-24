@@ -3569,6 +3569,12 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 apply_flags(app, Some("forward"));
                 app.locale = crate::i18n::Locale::PortugueseBrazil;
             }
+            "view-once" | "view-once-off" => {
+                let (photo, _) = sample_files(app);
+                app.stage(crate::app::Pending::File(photo));
+                app.pending_view_once = part == "view-once";
+                app.composer = "One moment, just for you.".into();
+            }
             "staged" => {
                 let (photo, _) = sample_files(app);
                 let side = 48usize;
@@ -6253,6 +6259,9 @@ mod tests {
             "search",
             "forward-portuguese",
             "staged",
+            "view-once-off",
+            "view-once",
+            "view-once,light",
             "attachment-draft-away",
             "attachment-draft-return",
             "crop",
@@ -6926,6 +6935,148 @@ mod tests {
                     labels.iter().any(|label| label == "Encaminhar"),
                     "{labels:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    /// Measures actual modal, list, close and footer rectangles, without sending.
+    fn forward_layout_fits_small_viewports_and_preserves_profile_search() {
+        for size in [
+            egui::vec2(360.0, 240.0),
+            egui::vec2(360.0, 600.0),
+            egui::vec2(1180.0, 780.0),
+        ] {
+            for page in [
+                "forward",
+                "forward-selected",
+                "forward-once",
+                "forward-full",
+                "forward-review",
+            ] {
+                let mut app = app();
+                app.backend.record_demo_commands();
+                let ctx = egui::Context::default();
+                app.attach(&ctx);
+                app.locale = crate::i18n::Locale::PortugueseBrazil;
+                apply_flags(&mut app, Some(page));
+                let selected = app.forward_recipients.clone();
+                let limit = app.forward_limit;
+                for i in 0..12 {
+                    app.chats.push(Chat::new(
+                        format!("{}@s.whatsapp.net", 100 + i),
+                        "Fixture".into(),
+                    ));
+                }
+                render_sized(&mut app, &ctx, size);
+                let viewport = ctx.content_rect();
+                for part in ["modal", "footer", "list", "close"] {
+                    let rect = ctx
+                        .data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new(("forward-layout", part)))
+                        })
+                        .expect(part);
+                    assert!(
+                        rect.is_positive() && viewport.expand(1.0).contains_rect(rect),
+                        "{page} {size:?} {part}: {rect:?} outside {viewport:?}"
+                    );
+                }
+                let list = ctx
+                    .data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::new(("forward-layout", "list")))
+                    })
+                    .unwrap();
+                let footer = ctx
+                    .data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::new(("forward-layout", "footer")))
+                    })
+                    .unwrap();
+                assert!(
+                    list.bottom() <= footer.top() + 1.0,
+                    "list overlaps footer: {page} {size:?}"
+                );
+                assert!(
+                    list.height() >= 16.0,
+                    "recipient list collapsed: {page} {size:?}"
+                );
+                assert_eq!(app.forward_recipients, selected);
+                assert_eq!(app.forward_limit, limit);
+                assert!(
+                    !app.backend
+                        .take_demo_commands()
+                        .iter()
+                        .any(|command| matches!(command, crate::backend::Command::Forward { .. }))
+                );
+            }
+        }
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("forward"));
+        let id = SAMPLES[0].id;
+        app.contacts.insert(
+            id.into(),
+            Contact {
+                id: id.into(),
+                push_name: Some("Profile Fixture".into()),
+                ..Contact::default()
+            },
+        );
+        app.forward_search = "profile fixture".into();
+        assert_eq!(app.chat_title(app.chat(id).unwrap()), "~Profile Fixture");
+        render_sized(&mut app, &ctx, egui::vec2(360.0, 240.0));
+        assert!(
+            ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("forward-recipient", id))))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn forward_uses_large_windows_and_keeps_room_when_search_changes() {
+        for size in [egui::vec2(1180.0, 780.0), egui::vec2(1920.0, 1080.0)] {
+            for page in [
+                "forward",
+                "forward-selected",
+                "forward-full",
+                "forward-review",
+            ] {
+                for search in ["", "Ada", "no-fixture-matches"] {
+                    let mut app = app();
+                    app.backend.record_demo_commands();
+                    let ctx = egui::Context::default();
+                    app.attach(&ctx);
+                    apply_flags(&mut app, Some(page));
+                    app.forward_search = search.into();
+                    let selected = app.forward_recipients.clone();
+                    render_sized(&mut app, &ctx, size);
+                    let part = |name| {
+                        ctx.data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new(("forward-layout", name)))
+                        })
+                        .unwrap()
+                    };
+                    let modal = part("modal");
+                    let list = part("list");
+                    let footer = part("footer");
+                    let viewport = ctx.content_rect();
+                    assert!(viewport.expand(1.0).contains_rect(modal));
+                    assert!(
+                        modal.width() >= (size.x * 0.55).min(700.0),
+                        "modal remains narrow on a large window: {size:?} {page} {search:?}: {modal:?}"
+                    );
+                    assert!(
+                        modal.height() >= (size.y * 0.75).min(760.0),
+                        "modal remains short on a large window: {size:?} {page}: {modal:?}"
+                    );
+                    assert!(
+                        (0.0..=12.0).contains(&(footer.top() - list.bottom())),
+                        "recipient list shrinks instead of filling the modal: {size:?} {page} {search:?}: {list:?} {footer:?}"
+                    );
+                    assert_eq!(app.forward_recipients, selected);
+                    assert!(!app.backend.take_demo_commands().iter().any(|command| {
+                        matches!(command, crate::backend::Command::Forward { .. })
+                    }));
+                }
             }
         }
     }
@@ -8349,6 +8500,61 @@ mod tests {
         );
     }
 
+    /// Actual composer input leaves the list steady; parking or discarding
+    /// that draft changes its priority only after leaving the conversation.
+    #[test]
+    fn typing_and_clearing_a_draft_do_not_reorder_the_chat_list() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let ids = |app: &App| -> Vec<String> {
+            app.visible_chats()
+                .iter()
+                .map(|chat| chat.id.clone())
+                .collect()
+        };
+        let original = ids(&app);
+        let draft = SAMPLES[3].id;
+        let pinned = SAMPLES[0].id;
+        app.actions
+            .push(crate::model::Action::OpenChat(draft.into()));
+        app.focus_composer = true;
+        render(&mut app, &ctx);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("Synthetic unfinished reply".into())],
+        );
+        assert_eq!(app.composer, "Synthetic unfinished reply");
+        assert_eq!(ids(&app), original, "typing cannot promote the open chat");
+        app.actions
+            .push(crate::model::Action::OpenChat(pinned.into()));
+        frame_with(&mut app, &ctx, vec![]);
+        let parked = ids(&app);
+        assert_eq!(parked[0], pinned, "the pin stays first");
+        assert_eq!(parked[1], draft, "the parked draft follows the pin");
+        app.actions
+            .push(crate::model::Action::OpenChat(draft.into()));
+        app.focus_composer = true;
+        render(&mut app, &ctx);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::A, egui::Modifiers::COMMAND)],
+        );
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Backspace, egui::Modifiers::NONE)],
+        );
+        assert!(app.composer.is_empty());
+        assert_eq!(ids(&app), parked, "clearing cannot demote the open chat");
+        app.actions
+            .push(crate::model::Action::OpenChat(pinned.into()));
+        frame_with(&mut app, &ctx, vec![]);
+        assert_eq!(ids(&app), original, "leaving drops the cleared draft");
+    }
+
     #[test]
     fn enter_sends_and_shift_enter_breaks_the_line() {
         let mut app = app();
@@ -8736,6 +8942,142 @@ mod tests {
                 assert!(app.pending.is_empty());
                 assert!(app.image_preview.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn view_once_photo_toggle_supports_click_keyboard_and_send() {
+        use crate::ui::focus::{Stop, control};
+        let mut app = app();
+        apply_flags(&mut app, Some("view-once-off"));
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+
+        press_labelled(&mut app, &ctx, "View once", egui::accesskit::Role::CheckBox);
+        assert!(app.pending_view_once);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("composer-text")));
+        frame_with(&mut app, &ctx, tab());
+        assert_eq!(focused_stop(&ctx), Some(Stop::ViewOnce));
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Space, egui::Modifiers::NONE)],
+        );
+        render(&mut app, &ctx);
+        assert!(
+            !app.pending_view_once,
+            "Space switches the selected icon off"
+        );
+
+        press_labelled(&mut app, &ctx, "View once", egui::accesskit::Role::CheckBox);
+        app.backend.take_demo_commands();
+        press_labelled(&mut app, &ctx, "Send", egui::accesskit::Role::Button);
+        assert!(
+            app.backend
+                .take_demo_commands()
+                .iter()
+                .any(|command| matches!(command,
+            crate::backend::Command::SendFiles { view_once: true, caption: Some(caption), .. }
+                if caption == "One moment, just for you."))
+        );
+        assert!(app.pending.is_empty());
+        assert!(!app.pending_view_once);
+        assert!(control(&ctx, Stop::ViewOnce).is_none());
+    }
+
+    #[test]
+    fn view_once_photo_control_fits_the_caption_in_both_themes_and_narrow_windows() {
+        use crate::ui::focus::{Stop, control};
+        for page in ["view-once", "view-once,light"] {
+            for width in [380.0, 640.0, 1180.0] {
+                let mut app = app();
+                apply_flags(&mut app, Some(page));
+                apply_flags(&mut app, Some("nosidebar"));
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                app.attach(&ctx);
+                for _ in 0..4 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 780.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let ctx = ui.ctx().clone();
+                            app.background_frame(&ctx);
+                            app.frame_ui(ui);
+                        },
+                    );
+                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                    let toggle = tree
+                        .nodes
+                        .iter()
+                        .map(|(_, node)| node)
+                        .find(|node| node.label() == Some("View once"))
+                        .expect("the icon has a readable name");
+                    assert_eq!(toggle.role(), egui::accesskit::Role::CheckBox);
+                    assert_eq!(toggle.toggled(), Some(egui::accesskit::Toggled::True));
+                    output.textures_delta.clear();
+                }
+                let toggle = ctx
+                    .read_response(control(&ctx, Stop::ViewOnce).unwrap())
+                    .unwrap()
+                    .rect;
+                let send = ctx
+                    .read_response(control(&ctx, Stop::Send).unwrap())
+                    .unwrap()
+                    .rect;
+                let caption = ctx
+                    .read_response(egui::Id::new("composer-text"))
+                    .unwrap()
+                    .rect;
+                let pill = ctx
+                    .data(|data| {
+                        data.get_temp::<egui::Rect>(crate::ui::conversation::composer_pill_id())
+                    })
+                    .unwrap();
+                assert!(caption.right() <= toggle.left(), "{page} {width}");
+                assert!(toggle.right() <= send.left(), "{page} {width}");
+                assert!(
+                    pill.contains_rect(toggle) && pill.contains_rect(send),
+                    "{page} {width}"
+                );
+                assert!((toggle.center().y - send.center().y).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn view_once_toggle_is_hidden_for_documents_batches_and_edits() {
+        use crate::ui::focus::{Stop, control};
+        for kind in ["document", "batch", "video", "edit"] {
+            let mut app = app();
+            apply_flags(&mut app, Some("view-once-off"));
+            let path = match &app.pending[0].item {
+                crate::app::Pending::File(path) => path.clone(),
+                _ => unreachable!(),
+            };
+            match kind {
+                "document" => app.pending[0].item = crate::app::Pending::Document(path),
+                "video" => {
+                    app.pending[0].item = crate::app::Pending::File("/fixture/clip.mp4".into())
+                }
+                "batch" => {
+                    app.stage(crate::app::Pending::File(path));
+                }
+                "edit" => apply_flags(&mut app, Some("edit")),
+                _ => unreachable!(),
+            }
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            render(&mut app, &ctx);
+            assert!(control(&ctx, Stop::ViewOnce).is_none(), "{kind}");
         }
     }
 
@@ -18074,10 +18416,31 @@ mod picture_edge_tests {
                 })
                 .collect::<Vec<_>>()
         };
-        // The picture decodes on a loader thread.
+        // Wait for the actual decode before measuring stability. A fixed
+        // sleep can expire before the loader runs on a busy CI host.
+        let uri = crate::util::image_uri(&photo);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            frame(&mut app);
+            if matches!(
+                ctx.try_load_texture(
+                    &uri,
+                    egui::TextureOptions::default(),
+                    egui::SizeHint::default()
+                ),
+                Ok(egui::load::TexturePoll::Ready { .. })
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sample picture did not decode"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Let the decoded dimensions reach the transcript's cached row layout.
         for _ in 0..30 {
             frame(&mut app);
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let settled = frame(&mut app);
         for _ in 0..6 {
@@ -18421,6 +18784,13 @@ mod bubble_detail_tests {
         let ctx = egui::Context::default();
         app.attach(&ctx);
         apply_flags(&mut app, Some("drafts"));
+        let ordered = app.visible_chats();
+        assert_eq!(ordered[0].id, SAMPLES[0].id, "the pin stays above drafts");
+        assert_eq!(ordered[1].id, SAMPLES[2].id, "the newer draft follows pins");
+        assert_eq!(
+            ordered[2].id, SAMPLES[3].id,
+            "drafts precede newer messages"
+        );
         let shapes = frames(&mut app, &ctx, egui::vec2(1180.0, 780.0));
         let texts: Vec<(String, egui::Color32)> = shapes
             .iter()

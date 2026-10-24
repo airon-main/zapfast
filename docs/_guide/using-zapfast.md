@@ -8,6 +8,10 @@ nav_order: 3
 
 ## Writing
 
+Undo and redo in the message field apply to its current chat and account.
+Switching chats or accounts, closing a chat, or unlinking clears the editor's
+undo history. Saved drafts remain available when you return to their chat.
+
 Enter sends and Shift+Enter adds a line. Turn off **Enter sends** in Settings
 to make Enter add a line and send with Ctrl+Enter (Command+Enter on macOS).
 `*bold*`, `_italic_`, `~strike~`, and ```` ```monospace ```` ```` format
@@ -46,6 +50,9 @@ several, **Review recipients** lists them for you to confirm, and **Back**
 returns to the picker without losing the selection. If a destination becomes
 locked or read-only, ZapFast returns to selection instead of sending a partial
 batch. Switching accounts discards the open forwarding selection.
+In a large window the dialog takes more of the window, so more recipients fit
+at once; it still stays inside a narrow or short one, and searching or changing
+the selection does not collapse the list.
 
 Right-click a group message and choose **Reply privately** to open a direct
 conversation with its sender while quoting the group message. The quote
@@ -216,6 +223,16 @@ caption. To reply with an attachment, start a reply and then attach the file.
 When sending several files, the caption and reply quote belong to the first
 one. Press Escape or click a file's close button to remove it.
 
+With exactly one supported photo (JPEG, PNG, or WebP) staged, select
+the **View once** icon (a 1 inside a dashed circle) beside Send. It lights up
+when enabled, and sends the photo as a WhatsApp view-once message. You can still
+add a caption. The sent message appears as a view-once placeholder in ZapFast;
+the recipient opens it on their phone. This option is not available for
+documents or batches of attachments.
+If you add more attachments, or a refused send returns to a draft with other
+attachments, remove the extras or turn off **View once** before sending.
+ZapFast keeps this choice until you switch it off, send, or clear the draft.
+
 Pictures sent this way become photos, which WhatsApp shows inline but
 compresses: transparency and the file's metadata are lost. To send a picture as
 it is, choose **Send as document** in the plus menu beside the message field
@@ -227,6 +244,12 @@ Staged attachments stay with their chat, along with their caption and reply,
 when you switch chats or accounts, and come back when you return. Unlike text
 drafts, they are kept only while ZapFast runs. A refused attachment send goes
 back to the chat it was meant for.
+
+Pinned chats stay first. Other chats with unsent text or attachments appear
+below the pins once you leave their conversation. Opening a draft, typing,
+or clearing it keeps its draft priority until you leave again. Within each
+group, chats keep their usual latest-message order. The Favorites chip keeps
+the phone's favorites order below pins.
 
 Click a picture above the composer to crop it before you send it. The picture
 opens over the window with the region to keep marked, and you can drag that
@@ -818,6 +841,8 @@ Windows, notifications show the chat picture. On Linux, Windows, and macOS, a
 click on a notification opens the chat at the message it announced. This holds for the 32 most recent tracked notifications on all three platforms;
 older notifications remain in system history without a message click listener.
 Reading a chat removes its tracked notifications, including Windows toasts.
+On Windows, while every display is off, ZapFast leaves new-message notifications
+to the phone instead of queuing desktop banners to appear when the display turns on.
 Fastframe provides the same delivery and cancellation interface on each platform. macOS
 asks once for permission to show notifications. On Linux, a notification that arrives while the
 window is open behind others also highlights ZapFast in the taskbar until you

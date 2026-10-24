@@ -24,6 +24,9 @@ mod pins;
 pub use pins::{Pinned, Pinner};
 mod polls;
 mod receipts;
+mod reconcile;
+#[cfg(test)]
+mod reconcile_tests;
 mod stars;
 mod stickers;
 pub use polls::PollVote;
@@ -164,6 +167,9 @@ CREATE TABLE IF NOT EXISTS group_receipts (
 CREATE TRIGGER IF NOT EXISTS delete_group_receipts AFTER DELETE ON messages BEGIN
     DELETE FROM group_receipts WHERE chat = OLD.chat AND id = OLD.id;
 END;
+-- One person can be both a privacy id and a phone number; merging the two
+-- looks receipts up by recipient, and the primary key cannot serve that.
+CREATE INDEX IF NOT EXISTS group_receipts_by_recipient ON group_receipts (recipient);
 ";
 
 const CHAT_COLUMNS: &str =
@@ -1176,6 +1182,7 @@ impl Archive {
                 history_order = COALESCE(messages.history_order, excluded.history_order)",
             params![lid_chat, phone_chat],
         )?;
+        Self::move_message_metadata(&transaction, &lid_chat, &phone_chat)?;
         transaction.execute(
             "INSERT OR IGNORE INTO polls (chat, id, creator, secret) SELECT ?2, id, creator, secret FROM polls WHERE chat = ?1",
             params![lid_chat, phone_chat],

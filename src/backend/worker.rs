@@ -823,6 +823,8 @@ pub async fn run(
     worker.backfill_video_notes();
     worker.backfill_view_once();
     worker.backfill_motion_photos();
+    worker.backfill_hd_copies();
+    worker.backfill_group_status_mentions();
     worker.backfill_interactive();
     worker.relocate_media();
     discard_attachment_staging(&worker.dirs.media_cache_dir());
@@ -1069,6 +1071,12 @@ fn message_removal_outcome(
 struct EditGenerations {
     sent: u64,
     applied: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FileSendOptions {
+    documents: bool,
+    view_once: bool,
 }
 
 struct Worker {
@@ -2481,6 +2489,66 @@ impl Worker {
         }
         if removed > 0 {
             log::info!("removed {removed} archived motion photo clips");
+            self.emit_chats();
+        }
+    }
+
+    /// Removes the HD copies of photos and videos, filed as unsupported
+    /// messages before they were recognised. Their standard copies stay.
+    fn backfill_hd_copies(&mut self) {
+        self.remove_archived_unsupported("hd_copies", hd_copy, "HD copies");
+    }
+
+    /// Removes the notices that someone mentioned a group in their status,
+    /// filed as unsupported messages before they were recognised (#595).
+    fn backfill_group_status_mentions(&mut self) {
+        self.remove_archived_unsupported(
+            "group_status_mentions",
+            group_status_mention,
+            "group status mentions",
+        );
+    }
+
+    /// Removes, once (`key` records it), the archived unsupported messages
+    /// `hidden` recognises as nothing to show.
+    fn remove_archived_unsupported(
+        &mut self,
+        key: &str,
+        hidden: fn(&wa::Message) -> bool,
+        what: &str,
+    ) {
+        if self.archive.meta(key).ok().flatten().as_deref() == Some("1") {
+            return;
+        }
+        let rows = match self.archive.unsupported_with_raw() {
+            Ok(rows) => rows,
+            Err(error) => {
+                log::warn!("could not read archived unsupported messages: {error}");
+                return;
+            }
+        };
+        let mut removed = 0;
+        let mut failed = false;
+        for (chat, id, raw) in rows {
+            let Ok(message) = wa::Message::decode_from_slice(&raw) else {
+                continue;
+            };
+            if !hidden(message.get_base_message()) {
+                continue;
+            }
+            match self.archive.delete_message(&chat, &id) {
+                Ok(_) => removed += 1,
+                Err(error) => {
+                    log::warn!("could not remove an archived message ({what}): {error}");
+                    failed = true;
+                }
+            }
+        }
+        if !failed {
+            let _ = self.archive.set_meta(key, "1");
+        }
+        if removed > 0 {
+            log::info!("removed {removed} archived {what}");
             self.emit_chats();
         }
     }
@@ -6448,21 +6516,35 @@ impl Worker {
                 chat,
                 paths,
                 documents,
+                view_once,
                 caption,
                 mentions,
                 quoting,
             } => {
-                self.send_files(chat, paths, documents, caption, mentions, quoting);
+                self.send_files(
+                    chat,
+                    paths,
+                    FileSendOptions {
+                        documents,
+                        view_once,
+                    },
+                    caption,
+                    mentions,
+                    quoting,
+                );
             }
             Command::SendImage {
                 chat,
                 width,
                 height,
                 rgba,
+                view_once,
                 caption,
                 mentions,
                 quoting,
-            } => self.send_pasted_image(chat, width, height, rgba, caption, mentions, quoting),
+            } => self.send_pasted_image(
+                chat, width, height, rgba, view_once, caption, mentions, quoting,
+            ),
             Command::Outbound { chat, row, raw } => self.outbound(chat, *row, raw),
             Command::SendSticker {
                 chat,
@@ -9894,16 +9976,36 @@ impl Worker {
         &mut self,
         chat: ChatId,
         paths: Vec<PathBuf>,
-        documents: bool,
+        options: FileSendOptions,
         caption: Option<String>,
         mentions: Vec<String>,
         quoting: Option<crate::model::ReplyTarget>,
     ) {
+        let FileSendOptions {
+            documents,
+            view_once,
+        } = options;
         let unsent = |paths, caption| Unsent::Files {
             paths,
             documents,
+            view_once,
             caption,
         };
+        if view_once
+            && (documents
+                || paths.len() != 1
+                || !paths
+                    .first()
+                    .is_some_and(|path| crate::app::Pending::is_view_once_photo_file(path)))
+        {
+            self.refuse(
+                chat,
+                quoting,
+                unsent(paths, caption),
+                Refusal::UnsupportedViewOnce,
+            );
+            return;
+        }
         let mut quote = match self.quote_target(&chat, quoting.as_ref()) {
             Ok(quote) => quote,
             Err(reason) => {
@@ -9948,11 +10050,14 @@ impl Worker {
                     let file_name = path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned());
-                    let prepared = if documents {
+                    let mut prepared = if documents {
                         prepare_document(&client, bytes, &mime, file_name.as_deref()).await?
                     } else {
                         prepare_media(&client, bytes, &mime, file_name.as_deref(), false).await?
                     };
+                    if view_once {
+                        mark_view_once_photo(&mut prepared)?;
+                    }
                     quoted_outbound(
                         &client, &chat, &me, &dir, prepared, caption, mentions, quote,
                     )
@@ -9987,6 +10092,7 @@ impl Worker {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+        view_once: bool,
         caption: Option<String>,
         mentions: Vec<String>,
         quoting: Option<crate::model::ReplyTarget>,
@@ -9995,6 +10101,7 @@ impl Worker {
             width,
             height,
             rgba,
+            view_once,
             caption,
         };
         let quote = match self.quote_target(&chat, quoting.as_ref()) {
@@ -10027,7 +10134,11 @@ impl Worker {
                 })
                 .await
                 .map_err(|error| error.to_string())??;
-                let prepared = prepare_media(&client, encoded, "image/jpeg", None, false).await?;
+                let mut prepared =
+                    prepare_media(&client, encoded, "image/jpeg", None, false).await?;
+                if view_once {
+                    mark_view_once_photo(&mut prepared)?;
+                }
                 quoted_outbound(
                     &client, &chat, &me, &dir, prepared, caption, mentions, quote,
                 )
@@ -10255,7 +10366,7 @@ impl Worker {
             return;
         };
         let expiration = self.apply_ephemeral(&chat, &mut message);
-        let raw = message.encode_to_vec();
+        let raw = attachment_archive_raw(&message);
         let id = row.id.clone();
         self.store_message(row, Some(raw), None);
         tokio::spawn(send_outgoing(
@@ -11253,7 +11364,11 @@ fn classify_base(base: &wa::Message) -> Option<Content> {
             what: what.to_owned(),
         })
     };
-    if base.album_message.is_set() || motion_photo_child(base) {
+    if base.album_message.is_set()
+        || motion_photo_child(base)
+        || hd_copy(base)
+        || group_status_mention(base)
+    {
         return None;
     }
     if base.group_invite_message.is_set() {
@@ -11353,6 +11468,63 @@ fn motion_photo_child(base: &wa::Message) -> bool {
             .and_then(|video| video.context_info.as_option())
             .and_then(|context| context.paired_media_type)
             == Some(PairedMediaType::MOTION_PHOTO_CHILD)
+}
+
+/// Whether `base` is the notice that someone mentioned this group in their
+/// status. The phone and WhatsApp for Mac show no message for it in the
+/// group, and its status is not something a linked device can open (#595).
+fn group_status_mention(base: &wa::Message) -> bool {
+    base.group_status_mention_message.is_set()
+}
+
+/// Whether `base` carries the HD copy of a photo or video that was also sent
+/// in standard quality. The standard copy is the message, so the HD copy
+/// beside it is not a second one.
+fn hd_copy(base: &wa::Message) -> bool {
+    use wa::context_info::PairedMediaType;
+    use wa::message_association::AssociationType;
+    let Some(child) = base
+        .associated_child_message
+        .as_option()
+        .and_then(|wrapper| wrapper.message.as_option())
+    else {
+        return false;
+    };
+    let dual_upload = |message: &wa::Message| {
+        matches!(
+            message
+                .message_context_info
+                .as_option()
+                .and_then(|context| context.message_association.as_option())
+                .and_then(|association| association.association_type),
+            Some(
+                AssociationType::HD_IMAGE_DUAL_UPLOAD
+                    | AssociationType::HD_VIDEO_DUAL_UPLOAD
+                    | AssociationType::HEVC_VIDEO_DUAL_UPLOAD
+            )
+        )
+    };
+    let paired = child
+        .image_message
+        .as_option()
+        .and_then(|image| image.context_info.as_option())
+        .or_else(|| {
+            child
+                .video_message
+                .as_option()
+                .and_then(|video| video.context_info.as_option())
+        })
+        .and_then(|context| context.paired_media_type);
+    dual_upload(base)
+        || dual_upload(child)
+        || matches!(
+            paired,
+            Some(
+                PairedMediaType::HD_IMAGE_CHILD
+                    | PairedMediaType::HD_VIDEO_CHILD
+                    | PairedMediaType::HEVC_VIDEO_CHILD
+            )
+        )
 }
 
 /// The id of the photo a motion photo's clip belongs to, and the clip as a
@@ -11950,6 +12122,33 @@ fn add_mentions(message: &mut wa::Message, mentions: &[String]) {
     message.set_context_info(context);
 }
 
+/// Marks a prepared photo for WhatsApp's view-once send path. The protocol
+/// library recognizes this field when it builds the outgoing stanza metadata.
+fn mark_view_once_photo(prepared: &mut Prepared) -> Result<(), String> {
+    if !matches!(&prepared.content, Content::Image { .. }) {
+        return Err("View once is only available for photos".to_owned());
+    }
+    let Some(image) = prepared.message.image_message.as_option_mut() else {
+        return Err("View once is only available for photos".to_owned());
+    };
+    image.view_once = Some(true);
+    Ok(())
+}
+
+/// Keeps the outgoing photo's thumbnail on the wire, but out of its local archive.
+/// Prepared attachments carry their photo directly in `image_message`.
+fn attachment_archive_raw(message: &wa::Message) -> Vec<u8> {
+    if message.is_view_once() {
+        let mut archived = message.clone();
+        if let Some(image) = archived.image_message.as_option_mut() {
+            image.jpeg_thumbnail = None;
+        }
+        archived.encode_to_vec()
+    } else {
+        message.encode_to_vec()
+    }
+}
+
 pub(super) async fn file_outbound(
     client: &Client,
     chat: &str,
@@ -11978,23 +12177,36 @@ pub(super) async fn file_outbound(
     }
     add_mentions(&mut prepared.message, &mentions);
     let id = client.generate_message_id().into_string();
-    let path = media_path(
-        dir,
-        chat,
-        &id,
-        &prepared.mime,
-        prepared.file_name.as_deref(),
-    );
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::fs::write(&path, &prepared.bytes)
-        .await
-        .map_err(|error| error.to_string())?;
     let mut content = prepared.content;
-    if let Some(media) = content.media_mut() {
-        media.path = Some(path);
-    }
+    let thumbnail = if prepared.message.is_view_once() {
+        let once = crate::model::OnceMedia::of(&content)
+            .filter(|kind| *kind == crate::model::OnceMedia::Photo)
+            .ok_or_else(|| "View once is only available for photos".to_owned())?;
+        content = Content::PhoneOnly {
+            view_once: true,
+            live_location: false,
+            once: Some(once),
+        };
+        None
+    } else {
+        let path = media_path(
+            dir,
+            chat,
+            &id,
+            &prepared.mime,
+            prepared.file_name.as_deref(),
+        );
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::fs::write(&path, &prepared.bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(media) = content.media_mut() {
+            media.path = Some(path);
+        }
+        prepared.thumbnail
+    };
     let row = Message {
         id,
         chat: chat.to_owned(),
@@ -12021,7 +12233,7 @@ pub(super) async fn file_outbound(
             })
             .collect(),
         forwarded: false,
-        thumbnail: prepared.thumbnail,
+        thumbnail,
     };
     Ok((row, prepared.message.encode_to_vec()))
 }
@@ -14280,6 +14492,89 @@ mod tests {
         ));
     }
 
+    /// Someone mentioning the group in their status sends the group a notice
+    /// the phone shows no message for, so it is not one here either (#595).
+    #[test]
+    fn a_group_status_mention_is_not_a_message() {
+        let mut proto = wa::Message::default();
+        proto.group_status_mention_message = MessageField::some({
+            let mut proto = wa::message::FutureProofMessage::default();
+            proto.message = MessageField::some(wa::Message::default());
+            proto
+        });
+        assert_eq!(classify(&proto), None);
+    }
+
+    #[test]
+    fn the_hd_copy_of_a_photo_or_video_is_not_a_message() {
+        use wa::context_info::PairedMediaType;
+        use wa::message_association::AssociationType;
+        let copy = |association_type: Option<AssociationType>, video: bool| {
+            let mut proto = wa::Message::default();
+            proto.associated_child_message = MessageField::some({
+                let mut proto = wa::message::FutureProofMessage::default();
+                proto.message = MessageField::some({
+                    let mut proto = wa::Message::default();
+                    if video {
+                        proto.video_message = MessageField::some({
+                            let mut proto = wa::message::VideoMessage::default();
+                            proto.mimetype = Some("video/mp4".into());
+                            proto
+                        });
+                    } else {
+                        proto.image_message = MessageField::some({
+                            let mut proto = wa::message::ImageMessage::default();
+                            proto.mimetype = Some("image/jpeg".into());
+                            proto
+                        });
+                    }
+                    proto
+                });
+                proto
+            });
+            proto.message_context_info = MessageField::some({
+                let mut proto = wa::MessageContextInfo::default();
+                proto.message_association = MessageField::some({
+                    let mut proto = wa::MessageAssociation::default();
+                    proto.association_type = association_type;
+                    proto
+                });
+                proto
+            });
+            proto
+        };
+        assert_eq!(
+            classify(&copy(Some(AssociationType::HD_IMAGE_DUAL_UPLOAD), false)),
+            None
+        );
+        assert_eq!(
+            classify(&copy(Some(AssociationType::HD_VIDEO_DUAL_UPLOAD), true)),
+            None
+        );
+        assert_eq!(
+            classify(&copy(Some(AssociationType::HEVC_VIDEO_DUAL_UPLOAD), true)),
+            None
+        );
+        // A copy that names no association is still known by its media.
+        let mut paired = copy(None, false);
+        paired
+            .associated_child_message
+            .as_option_mut()
+            .and_then(|wrapper| wrapper.message.as_option_mut())
+            .and_then(|child| child.image_message.as_option_mut())
+            .unwrap()
+            .context_info = MessageField::some({
+            let mut context = wa::ContextInfo::default();
+            context.paired_media_type = Some(PairedMediaType::HD_IMAGE_CHILD);
+            context
+        });
+        assert_eq!(classify(&paired), None);
+        assert!(matches!(
+            classify(&copy(None, false)),
+            Some(Content::Unsupported { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn newsletter_sends_are_rejected_before_reaching_the_client() {
         let (mut worker, events, _, _) = receipt_tests::worker();
@@ -14983,6 +15278,132 @@ mod tests {
             !matches!(classify(&buttons), Some(Content::PhoneOnly { .. })),
             "interactive messages share the wrapper and stay interactive"
         );
+    }
+
+    #[tokio::test]
+    async fn outgoing_view_once_photos_preserve_wire_metadata_without_caching_the_photo() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = whatsapp_rust::store::SqliteStore::open(
+            directory.path().join("session.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let bot = Bot::builder().with_backend(store).build().await.unwrap();
+        let client = bot.client();
+        let (mut worker, _events, _commands, _wa) = super::receipt_tests::worker();
+        worker.client = Some(client.clone());
+        let quote = Quoted {
+            chat: None,
+            id: "original".into(),
+            sender: "15551234567@s.whatsapp.net".into(),
+            sender_name: Some("Fixture".into()),
+            summary: "Original".into(),
+            labelled: Some(false),
+            mentions: vec![],
+        };
+        let mut context = wa::ContextInfo::default();
+        context.stanza_id = Some(quote.id.clone());
+        context.participant = Some(quote.sender.clone());
+        context.quoted_message = MessageField::some(wa::Message::text("Original"));
+        for view_once in [false, true] {
+            let cache = directory
+                .path()
+                .join(if view_once { "once" } else { "ordinary" });
+            let mut prepared = Prepared {
+                message: {
+                    let mut message = wa::Message::default();
+                    message.image_message = MessageField::some({
+                        let mut image = wa::message::ImageMessage::default();
+                        image.jpeg_thumbnail = Some(vec![1, 2, 3]);
+                        image
+                    });
+                    message
+                },
+                content: Content::Image {
+                    motion: None,
+                    caption: None,
+                    media: media(Some(&"image/jpeg".to_owned()), Some(4), Some(1), Some(1)),
+                },
+                thumbnail: Some(vec![1, 2, 3]),
+                bytes: vec![1, 2, 3, 4],
+                mime: "image/jpeg".into(),
+                file_name: None,
+            };
+            if view_once {
+                mark_view_once_photo(&mut prepared).unwrap();
+            }
+            let (row, raw) = quoted_outbound(
+                &client,
+                "15551234567@s.whatsapp.net",
+                "15550001111@s.whatsapp.net",
+                &cache,
+                prepared,
+                Some("Caption".into()),
+                vec!["15559876543@s.whatsapp.net".into()],
+                Some((context.clone(), quote.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(row.quoted, Some(quote.clone()));
+            if view_once {
+                assert_eq!(
+                    row.content,
+                    Content::PhoneOnly {
+                        view_once: true,
+                        live_location: false,
+                        once: Some(crate::model::OnceMedia::Photo),
+                    }
+                );
+                assert!(row.thumbnail.is_none());
+                assert!(
+                    !cache.exists(),
+                    "view-once bytes must not be cached locally"
+                );
+            } else {
+                let path = row.content.media().unwrap().path.as_ref().unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), [1, 2, 3, 4]);
+                assert_eq!(row.thumbnail, Some(vec![1, 2, 3]));
+            }
+            let raw = wa::Message::decode_from_slice(&raw).unwrap();
+            assert_eq!(raw.is_view_once(), view_once);
+            let image = raw.image_message.as_option().unwrap();
+            assert_eq!(image.view_once, view_once.then_some(true));
+            assert_eq!(image.caption.as_deref(), Some("Caption"));
+            let context = image.context_info.as_option().unwrap();
+            assert_eq!(
+                context.mentioned_jid,
+                ["15559876543@s.whatsapp.net".to_owned()]
+            );
+            assert_eq!(context.stanza_id.as_deref(), Some("original"));
+            assert_eq!(
+                context.quoted_message.as_option().unwrap().text_content(),
+                Some("Original")
+            );
+            let id = row.id.clone();
+            worker.outbound(row.chat.clone(), row, raw.encode_to_vec());
+            let archived = wa::Message::decode_from_slice(
+                &worker
+                    .archive
+                    .raw("15551234567@s.whatsapp.net", &id)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut expected = raw.clone();
+            if view_once {
+                expected
+                    .image_message
+                    .as_option_mut()
+                    .unwrap()
+                    .jpeg_thumbnail = None;
+            }
+            assert_eq!(archived, expected);
+            assert_eq!(
+                raw.image_message.as_option().unwrap().jpeg_thumbnail,
+                Some(vec![1, 2, 3]),
+                "the message sent to WhatsApp must keep its thumbnail"
+            );
+        }
     }
 
     #[test]
@@ -20384,6 +20805,81 @@ mod receipt_tests {
         }
     }
 
+    #[tokio::test]
+    async fn view_once_file_refusals_preserve_the_choice_without_falling_back_to_normal_media() {
+        let (mut worker, events, _commands, _wa) = worker();
+        for (paths, documents, reason) in [
+            (vec![PathBuf::from("photo.png")], false, Refusal::Offline),
+            (
+                vec![PathBuf::from("photo.png")],
+                true,
+                Refusal::UnsupportedViewOnce,
+            ),
+            (
+                vec![PathBuf::from("photo.png"), PathBuf::from("second.jpg")],
+                false,
+                Refusal::UnsupportedViewOnce,
+            ),
+            (
+                vec![PathBuf::from("clip.mp4")],
+                false,
+                Refusal::UnsupportedViewOnce,
+            ),
+            (
+                vec![PathBuf::from("photo.bmp")],
+                false,
+                Refusal::UnsupportedViewOnce,
+            ),
+            (
+                vec![PathBuf::from("photo.tiff")],
+                false,
+                Refusal::UnsupportedViewOnce,
+            ),
+            (Vec::new(), false, Refusal::UnsupportedViewOnce),
+        ] {
+            let caption = Some("Caption fixture".to_owned());
+            worker
+                .handle_command(Command::SendFiles {
+                    chat: PEER.into(),
+                    paths: paths.clone(),
+                    documents,
+                    view_once: true,
+                    caption: caption.clone(),
+                    mentions: vec![],
+                    quoting: None,
+                })
+                .await;
+            let refused: Vec<_> = events
+                .try_iter()
+                .filter(|event| matches!(event, Event::SendRefused { .. }))
+                .collect();
+            let expected = Unsent::Files {
+                paths,
+                documents,
+                view_once: true,
+                caption,
+            };
+            assert!(matches!(refused.as_slice(),
+                [Event::SendRefused { unsent, reason: actual, .. }]
+                    if unsent == &expected && actual == &reason));
+        }
+        worker
+            .handle_command(Command::SendImage {
+                chat: PEER.into(),
+                width: 1,
+                height: 1,
+                rgba: vec![255; 4],
+                view_once: true,
+                caption: Some("Pasted fixture".into()),
+                mentions: vec![],
+                quoting: None,
+            })
+            .await;
+        assert!(events.try_iter().any(|event| matches!(event,
+            Event::SendRefused { unsent: Unsent::Image { view_once: true, caption: Some(caption), .. }, reason: Refusal::Offline, .. }
+                if caption == "Pasted fixture")));
+    }
+
     /// Enumerates synthetic send commands and matching unsent payloads with a shared quote target.
     fn reply_sends(quoting: Option<crate::model::ReplyTarget>) -> Vec<(Command, Unsent)> {
         let gif = Gif {
@@ -20416,6 +20912,7 @@ mod receipt_tests {
                     chat: PEER.into(),
                     paths: vec!["/fixture/a.pdf".into(), "/fixture/b.png".into()],
                     documents: false,
+                    view_once: false,
                     caption: Some("Caption fixture".into()),
                     mentions: Vec::new(),
                     quoting: quoting.clone(),
@@ -20423,6 +20920,7 @@ mod receipt_tests {
                 Unsent::Files {
                     paths: vec!["/fixture/a.pdf".into(), "/fixture/b.png".into()],
                     documents: false,
+                    view_once: false,
                     caption: Some("Caption fixture".into()),
                 },
             ),
@@ -20431,6 +20929,7 @@ mod receipt_tests {
                     chat: PEER.into(),
                     paths: vec!["/fixture/c.png".into()],
                     documents: true,
+                    view_once: false,
                     caption: None,
                     mentions: Vec::new(),
                     quoting: quoting.clone(),
@@ -20438,6 +20937,7 @@ mod receipt_tests {
                 Unsent::Files {
                     paths: vec!["/fixture/c.png".into()],
                     documents: true,
+                    view_once: false,
                     caption: None,
                 },
             ),
@@ -20447,6 +20947,7 @@ mod receipt_tests {
                     width: 1,
                     height: 1,
                     rgba: vec![1, 2, 3, 4],
+                    view_once: false,
                     caption: Some("Picture fixture".into()),
                     mentions: Vec::new(),
                     quoting: quoting.clone(),
@@ -20455,6 +20956,7 @@ mod receipt_tests {
                     width: 1,
                     height: 1,
                     rgba: vec![1, 2, 3, 4],
+                    view_once: false,
                     caption: Some("Picture fixture".into()),
                 },
             ),
