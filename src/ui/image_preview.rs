@@ -61,6 +61,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     // from the palette, so the light theme reads as well as the dark one.
     let screen = ctx.content_rect();
     let screen = screen.with_min_y(screen.top() + theme::custom_titlebar_height(ctx));
+    let titlebar = Rect::from_min_max(
+        ctx.content_rect().min,
+        pos2(ctx.content_rect().right(), screen.top()),
+    );
     let area = egui::Area::new(egui::Id::new("image-preview"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min);
@@ -161,7 +165,22 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             }
             backdrop_clicked = backdrop.clicked();
         });
-    if response.should_close() || backdrop_clicked {
+    if titlebar.height() > 0.0 {
+        egui::Area::new(egui::Id::new("image-preview-titlebar-drag"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(titlebar.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(titlebar.size());
+                super::titlebar_drag(ui, titlebar);
+            });
+    }
+    let press_started_in_titlebar = ctx.input(|input| {
+        input
+            .pointer
+            .press_origin()
+            .is_some_and(|position| titlebar.contains(position))
+    });
+    if (response.should_close() && !press_started_in_titlebar) || backdrop_clicked {
         actions.push(Action::CloseImagePreview);
     }
     app.image_preview = Some(preview);

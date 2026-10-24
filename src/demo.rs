@@ -9605,6 +9605,45 @@ mod tests {
     }
 
     #[test]
+    fn image_preview_titlebar_press_does_not_close_the_modal() {
+        let mut app = app();
+        apply_flags(&mut app, Some("preview"));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        crate::theme::preview_titlebar(
+            &ctx,
+            fastframe_titlebar::Footprint {
+                left: 0.0,
+                right: 120.0,
+                height: 42.0,
+            },
+        );
+        render_sized(&mut app, &ctx, egui::vec2(1180.0, 780.0));
+
+        let pos = egui::pos2(500.0, 20.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pos), button(true)],
+        );
+        assert!(
+            app.image_preview.is_some(),
+            "titlebar press keeps the preview open"
+        );
+        frame_with(&mut app, &ctx, vec![button(false)]);
+        assert!(
+            app.image_preview.is_some(),
+            "titlebar click keeps the preview open"
+        );
+    }
+
+    #[test]
     fn preview_arrows_browse_photos_without_touching_the_draft() {
         let mut app = app();
         let ctx = egui::Context::default();
